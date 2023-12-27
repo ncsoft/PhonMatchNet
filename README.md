@@ -36,8 +36,10 @@ docker run -it --rm --gpus '"device=0,1"' \
         --lr 1e-3 \
         --loss_weight 1.0 1.0 \
         --audio_input both \
-        --text_input phoneme \
+        --text_input g2p_embed \
+        --stack_extractor \
         --comment 'user comments for each experiment'"
+
 ```
 
 ### Monitoring
