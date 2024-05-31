@@ -1,310 +1,353 @@
-import sys, os, datetime, warnings, argparse
-import tensorflow as tf
+import argparse
+import logging
+import os
+from pathlib import Path
+from tqdm import tqdm
+
 import numpy as np
+import torch
+import torch.utils.checkpoint
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed, LoggerType
 
 from model import ukws
 from dataset import libriphrase, google, qualcomm
+from dataset import KWSDataLoader
 from criterion import total
-from criterion.utils import eer
+from criterion.utils import eer, compute_eer
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-warnings.filterwarnings('ignore')
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning) 
-np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
-warnings.simplefilter("ignore")
+from torchmetrics.aggregation import MeanMetric
+from torchmetrics.classification import BinaryAUROC
+
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.deterministic = False
 
 seed = 42
-tf.random.set_seed(seed)
+torch.random.manual_seed(seed)
 np.random.seed(seed)
 
-checkpoint_dir = './interspeech/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
-tensorboard_prefix = os.path.join(checkpoint_dir, "tensorboard")
+logger = get_logger(__name__, log_level="INFO")
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--epoch', required=True, type=int)
-parser.add_argument('--lr', required=True, type=float)
-parser.add_argument('--loss_weight', default=[1.0, 1.0], nargs=2, type=float)
-parser.add_argument('--text_input', required=False, type=str, default='g2p_embed')
-parser.add_argument('--audio_input', required=False, type=str, default='both')
 
-parser.add_argument('--train_pkl', required=False, type=str, default='/home/DB/LibriPhrase/data/train_both.pkl')
-parser.add_argument('--google_pkl', required=False, type=str, default='/home/DB/google_speech_commands/google.pkl')
-parser.add_argument('--qualcomm_pkl', required=False, type=str, default='/home/DB/qualcomm_keyword_speech_dataset/qualcomm.pkl')
-parser.add_argument('--libriphrase_pkl', required=False, type=str, default='/home/DB/LibriPhrase/data/test_both.pkl')
+def parse_args():
+    parser = argparse.ArgumentParser(description="Argument supportable on this training script.")
+    parser.add_argument('--epoch', required=True, type=int)
+    parser.add_argument('--lr', required=True, type=float)
+    parser.add_argument('--batch_size', required=False, type=int, default=4096)
+    parser.add_argument('--num_workers', required=False, type=int, default=4)
+    parser.add_argument('--loss_weight', default=[1.0, 1.0], nargs=2, type=float)
+    parser.add_argument('--text_input', required=False, type=str, default='g2p_embed')
+    parser.add_argument('--audio_input', required=False, type=str, default='both')
+    parser.add_argument('--stack_extractor', action='store_true')
+    parser.add_argument('--audio_noise', action='store_true')
 
-parser.add_argument('--stack_extractor', action='store_true')
+    parser.add_argument('--frame_length', required=False, type=int, default=400)
+    parser.add_argument('--hop_length', required=False, type=int, default=160)
+    # parser.add_argument('--num_mel', required=False, type=int, default=40)  
+    # [Note] This argument is no longer used. If you want to change num_mel, the model/lin_to_mel_matrix.npy file should be re-extracted.  
+    parser.add_argument('--sample_rate', required=False, type=int, default=16000)
+    parser.add_argument('--log_mel', action='store_true')
 
-parser.add_argument('--comment', required=False, type=str)
-args = parser.parse_args()
+    parser.add_argument('--train_pkl', required=False, type=str, default='/home/train_both.pkl')
+    parser.add_argument('--google_pkl', required=False, type=str, default='/home/google.pkl')
+    parser.add_argument('--qualcomm_pkl', required=False, type=str, default='/home/qualcomm.pkl')
+    parser.add_argument('--libriphrase_pkl', required=False, type=str, default='/home/test_both.pkl')
 
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results",
+        help="The output directory where the model predictions and checkpoints will be written.",
+    )
+    parser.add_argument(
+        "--logging_dir",
+        type=str,
+        default="pmnet_torch",
+        help=(
+            "[TensorBoard](https://www.tensorflow.org/tensorboard) log directory. Will default to"
+            " *output_dir/runs/**CURRENT_DATETIME_HOSTNAME***."
+        ),
+    )
 
-strategy = tf.distribute.MirroredStrategy()
+    parser.add_argument('--comment', required=False, type=str)
+    args = parser.parse_args()
 
-# Batch size per GPU
-GLOBAL_BATCH_SIZE = 2048 * strategy.num_replicas_in_sync
-BATCH_SIZE_PER_REPLICA = GLOBAL_BATCH_SIZE / strategy.num_replicas_in_sync
+    return args
 
-# Make Dataloader
-text_input = args.text_input
-audio_input = args.audio_input
 
-train_dataset = libriphrase.LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, train=True, types='both', shuffle=True, pkl=args.train_pkl)
-test_dataset = libriphrase.LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, train=False, types='both', shuffle=True, pkl=args.libriphrase_pkl)
-test_easy_dataset = libriphrase.LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, train=False, types='easy', shuffle=True, pkl=args.libriphrase_pkl)
-test_hard_dataset = libriphrase.LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, train=False, types='hard', shuffle=True, pkl=args.libriphrase_pkl)
-test_google_dataset = google.GoogleCommandsDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, shuffle=True, pkl=args.google_pkl)
-test_qualcomm_dataset = qualcomm.QualcommKeywordSpeechDataloader(batch_size=GLOBAL_BATCH_SIZE, features=text_input, shuffle=True, pkl=args.qualcomm_pkl)
+def prepare_loader(args):
+    if args.audio_input == "raw":
+        gemb_dir = None
+    else:
+        gemb_dir = '/home/google_speech_embedding/DB/'
+    train_dataset = libriphrase.LibriPhraseDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, train=True, types='both', shuffle=True, pkl=args.train_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    train_loader = KWSDataLoader(train_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
 
-# Number of phonemes
-vocab = train_dataset.nPhoneme
-  
-# Convert tf.utils.sequence to tf.dataset
-train_dataset = libriphrase.convert_sequence_to_dataset(train_dataset)
-test_dataset = libriphrase.convert_sequence_to_dataset(test_dataset)
-test_easy_dataset = libriphrase.convert_sequence_to_dataset(test_easy_dataset)
-test_hard_dataset = libriphrase.convert_sequence_to_dataset(test_hard_dataset)
-test_google_dataset = google.convert_sequence_to_dataset(test_google_dataset)
-test_qualcomm_dataset = qualcomm.convert_sequence_to_dataset(test_qualcomm_dataset)
+    val_dataset = libriphrase.LibriPhraseDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, train=False, types='both', shuffle=True, pkl=args.libriphrase_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    val_easy_dataset = libriphrase.LibriPhraseDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, train=False, types='easy', shuffle=True, pkl=args.libriphrase_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    val_hard_dataset = libriphrase.LibriPhraseDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, train=False, types='hard', shuffle=True, pkl=args.libriphrase_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    val_google_dataset = google.GoogleCommandsDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, shuffle=True, pkl=args.google_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    val_qualcomm_dataset = qualcomm.QualcommKeywordSpeechDataset(batch_size=args.batch_size, gemb_dir=gemb_dir, 
+                                                      features=args.text_input, shuffle=True, pkl=args.qualcomm_pkl, 
+                                                      frame_length=args.frame_length, hop_length=args.hop_length)
+    
+    val_dataloader = KWSDataLoader(val_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
+    val_easy_dataloader = KWSDataLoader(val_easy_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
+    val_hard_dataloader = KWSDataLoader(val_hard_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
+    val_google_dataloader = KWSDataLoader(val_google_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
+    val_qualcomm_dataloader = KWSDataLoader(val_qualcomm_dataset, args.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=args.num_workers)
+    eval_loader = [
+        val_dataloader, 
+        val_easy_dataloader,
+        val_hard_dataloader,
+        val_google_dataloader,
+        val_qualcomm_dataloader,
+        ]
+    
+    vocab = train_dataset.nPhoneme
+    train_len = len(train_dataset)
 
-# Make disribute dataset for multi-gpu
-train_dist_dataset = strategy.experimental_distribute_dataset(train_dataset)
-test_dist_dataset = strategy.experimental_distribute_dataset(test_dataset)
-test_easy_dist_dataset = strategy.experimental_distribute_dataset(test_easy_dataset)
-test_hard_dist_dataset = strategy.experimental_distribute_dataset(test_hard_dataset)
-test_google_dist_dataset = strategy.experimental_distribute_dataset(test_google_dataset)
-test_qualcomm_dist_dataset = strategy.experimental_distribute_dataset(test_qualcomm_dataset)
+    return train_loader, eval_loader, vocab, train_len
 
-# Model params.
-kwargs = {
+
+def main():
+    args = parse_args()
+    logging_dir = Path(args.output_dir, args.logging_dir)
+
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+
+    accelerator = Accelerator(
+        log_with= LoggerType.TENSORBOARD,
+        project_config=accelerator_project_config,
+    )
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    set_seed(seed)
+
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            os.makedirs(args.output_dir, exist_ok=True)
+
+
+    train_dataloader, eval_dataloader, vocab, train_len = prepare_loader(args)
+
+    kwargs = {
         'vocab' : vocab,
-        'text_input' : text_input,
-        'audio_input' : audio_input,
-        'frame_length' : 400, 
-        'hop_length' : 160, 
-        'num_mel'  : 40, 
-        'sample_rate' : 16000,
-        'log_mel' : False,
+        'text_input' : args.text_input,
+        'audio_input' : args.audio_input,
         'stack_extractor' : args.stack_extractor,
+
+        'frame_length' : args.frame_length, 
+        'hop_length' : args.hop_length, 
+        'num_mel'  : 40,
+        'sample_rate' : args.sample_rate,
+        'log_mel' : args.log_mel,
     }
 
-# Train params.
-EPOCHS = args.epoch
-lr = args.lr
-
-# Make tensorboard dict.
-param = kwargs
-param['epoch'] = EPOCHS
-param['lr'] = lr
-param['loss weight'] = args.loss_weight
-param['comment'] = args.comment
-
-with strategy.scope():
-    loss_object = total.TotalLoss_SCE(weight=args.loss_weight)
-       
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
-    train_loss_d = tf.keras.metrics.Mean(name='train_loss_Utt')
-    train_loss_sce = tf.keras.metrics.Mean(name='train_loss_Phon')
-    
-    test_loss = tf.keras.metrics.Mean(name='test_loss')
-    test_loss_d = tf.keras.metrics.Mean(name='test_loss_Utt')
-    
-    train_auc = tf.keras.metrics.AUC(name='train_auc')
-    train_eer = eer(name='train_eer')
-    
-    test_auc = tf.keras.metrics.AUC(name='test_auc')
-    test_eer = eer(name='test_eer')
-    
-    test_easy_auc = tf.keras.metrics.AUC(name='test_easy_auc')
-    test_easy_eer = eer(name='test_easy_eer')
-    test_hard_auc = tf.keras.metrics.AUC(name='test_hard_auc')
-    test_hard_eer = eer(name='test_hard_eer')
-    
-    google_auc = tf.keras.metrics.AUC(name='google_auc')
-    google_eer = eer(name='google_eer')
-    qualcomm_auc = tf.keras.metrics.AUC(name='qualcomm_auc')
-    qualcomm_eer = eer(name='qualcomm_eer')
-
     model = ukws.BaseUKWS(**kwargs)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
-
-    @tf.function
-    def train_step(inputs):
-        clean_speech, noisy_speech, text, labels, speech_labels, text_labels = inputs
-        with tf.GradientTape(watch_accessed_variables=False, persistent=False) as tape:
-            model(clean_speech, text, training=False)
-            tape.watch(model.trainable_variables)
-            prob, affinity_matrix, LD, sce_logit = model(noisy_speech, text, training=True)
-            loss, LD, LC = loss_object(labels, LD, speech_labels, text_labels, sce_logit)
-            loss /= GLOBAL_BATCH_SIZE
-            LC /= GLOBAL_BATCH_SIZE
-            LD /= GLOBAL_BATCH_SIZE
-            
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        train_loss.update_state(loss)
-        train_loss_d.update_state(LD)
-        train_loss_sce.update_state(LC)
-        train_auc.update_state(labels, prob)
-        train_eer.update_state(labels, prob)
-        
-        return loss, tf.expand_dims(tf.cast(affinity_matrix * 255, tf.uint8), -1), labels
-
-    @tf.function
-    def test_step(inputs):
-        clean_speech = inputs[0]
-        text = inputs[1]
-        labels = inputs[2]
-        prob, affinity_matrix, LD, LC = model(clean_speech, text, training=False)[:4]
-            
-        t_loss, LD = total.TotalLoss(weight=args.loss_weight[0])(labels, LD)
-        t_loss /= GLOBAL_BATCH_SIZE
-        LD /= GLOBAL_BATCH_SIZE
-        
-        test_loss.update_state(t_loss)
-        test_loss_d.update_state(LD)
-        test_auc.update_state(labels, prob)
-        test_eer.update_state(labels, prob)
-        
-        return t_loss, tf.expand_dims(tf.cast(affinity_matrix * 255, tf.uint8), -1), labels
+    model.to(accelerator.device)
     
-    @tf.function
-    def test_step_metric_only(inputs, metric=[]):
-        clean_speech = inputs[0]
-        text = inputs[1]
-        labels = inputs[2]
-
-        prob = model(clean_speech, text, training=False)[0]
-        
-        for m in metric:
-            m.update_state(labels, prob)
-
-    train_log_dir = os.path.join(tensorboard_prefix, "train")
-    test_log_dir = os.path.join(tensorboard_prefix, "test")
-    train_summary_writer = tf.summary.create_file_writer(train_log_dir)
-    test_summary_writer = tf.summary.create_file_writer(test_log_dir)
-
-    def distributed_train_step(dataset_inputs):
-        per_replica_losses, per_replica_affinity_matrix, per_replica_labels = strategy.run(train_step, args=(dataset_inputs,))
-        return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None), strategy.experimental_local_results(per_replica_affinity_matrix)[0], strategy.experimental_local_results(per_replica_labels)[0]
-
-    def distributed_test_step(dataset_inputs):
-        per_replica_losses, per_replica_affinity_matrix, per_replica_labels = strategy.run(test_step, args=(dataset_inputs,))
-        return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None), strategy.experimental_local_results(per_replica_affinity_matrix)[0], strategy.experimental_local_results(per_replica_labels)[0]
+    loss_object = total.TotalLoss(weight=args.loss_weight[0])
+    loss_object_sce = total.TotalLoss_SCE(weight=args.loss_weight)
+    train_loss = MeanMetric()
+    train_loss_d = MeanMetric()
+    train_loss_sce = MeanMetric()
     
-    def distributed_test_step_metric_only(dataset_inputs, metric=[]):
-        strategy.run(test_step_metric_only, args=(dataset_inputs, metric))
+    test_loss = MeanMetric()
+    test_loss_d = MeanMetric()
 
-    with train_summary_writer.as_default():
-            tf.summary.text('Hyperparameters', tf.stack([tf.convert_to_tensor([k, str(v)]) for k, v in param.items()]), step=0)
-    
-    for epoch in range(EPOCHS):
-        # TRAIN LOOP
-        train_matrix = None
-        train_labels = None
-        test_matrix = None
-        train_labels = None
-        
-        for i, x in enumerate(train_dist_dataset):
-            _, train_matrix, train_labels = distributed_train_step(x)
-        
-        match_train_matrix = []
-        unmatch_train_matrix = []
-        for i, x in enumerate(train_labels):
-            if x == 1:
-                match_train_matrix.append(train_matrix[i])
-            elif x == 0:
-                unmatch_train_matrix.append(train_matrix[i])
-            
-        with train_summary_writer.as_default():
-            tf.summary.scalar('0. Total loss', train_loss.result(), step=epoch)
-            tf.summary.scalar('1. Utterance-level Detection loss', train_loss_d.result(), step=epoch)
-            tf.summary.scalar('2. Phoneme-levle Detection loss', train_loss_sce.result(), step=epoch)
-            tf.summary.scalar('3. AUC', train_auc.result(), step=epoch)
-            tf.summary.scalar('4. EER', train_eer.result(), step=epoch)
-            tf.summary.image("Affinity matrix (match)", match_train_matrix, max_outputs=5, step=epoch)
-            tf.summary.image("Affinity matrix (unmatch)", unmatch_train_matrix, max_outputs=5, step=epoch)
-            
-        # TEST LOOP
-        for x in test_dist_dataset:
-            _, test_matrix, test_labels = distributed_test_step(x)
-        
-        match_test_matrix = []
-        unmatch_test_matrix = []
-        for i, x in enumerate(test_labels):
-            if x == 1:
-                match_test_matrix.append(test_matrix[i])
-            elif x == 0:
-                unmatch_test_matrix.append(test_matrix[i])
-                
-        for x in test_easy_dist_dataset:
-            distributed_test_step_metric_only(x, metric=[test_easy_auc, test_easy_eer])
-            
-        for x in test_hard_dist_dataset:
-            distributed_test_step_metric_only(x, metric=[test_hard_auc, test_hard_eer])
+    train_auc = BinaryAUROC()
+    train_eer = eer()
 
-        for x in test_google_dist_dataset:
-            distributed_test_step_metric_only(x, metric=[google_auc, google_eer])
-            
-        for x in test_qualcomm_dist_dataset:
-            distributed_test_step_metric_only(x, metric=[qualcomm_auc, qualcomm_eer])
-            
-        with test_summary_writer.as_default():
-            tf.summary.scalar('0. Total loss', test_loss.result(), step=epoch)
-            tf.summary.scalar('1. Utterance-level Detection loss', test_loss_d.result(), step=epoch)
-            tf.summary.scalar('3. AUC', test_auc.result(), step=epoch)
-            tf.summary.scalar('3. AUC (EASY)', test_easy_auc.result(), step=epoch)
-            tf.summary.scalar('3. AUC (HARD)', test_hard_auc.result(), step=epoch)
-            tf.summary.scalar('3. AUC (Google)', google_auc.result(), step=epoch)
-            tf.summary.scalar('3. AUC (Qualcomm)', qualcomm_auc.result(), step=epoch)
-            tf.summary.scalar('4. EER', test_eer.result(), step=epoch)
-            tf.summary.scalar('4. EER (EASY)', test_easy_eer.result(), step=epoch)
-            tf.summary.scalar('4. EER (HARD)', test_hard_eer.result(), step=epoch)
-            tf.summary.scalar('4. EER (Google)', google_eer.result(), step=epoch)
-            tf.summary.scalar('4. EER (Qualcomm)', qualcomm_eer.result(), step=epoch)
-            tf.summary.image("Affinity matrix (match)", match_test_matrix, max_outputs=5, step=epoch)
-            tf.summary.image("Affinity matrix (unmatch)", unmatch_test_matrix, max_outputs=5, step=epoch)
+    test_auc = BinaryAUROC()
+    test_eer = eer()
 
-        if epoch % 1 == 0:
-            checkpoint.save(checkpoint_prefix)
+    optimizer = torch.optim.Adam(model.parameters(), lr = args.lr, betas = (0.9, 0.999), eps = 1e-7)
+
+    model, optimizer, train_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader
+    )
+
+    for i in range(len(eval_dataloader)):
+        eval_dataloader[i] = accelerator.prepare(eval_dataloader[i])
+
+    loss_object, loss_object_sce, train_loss, train_loss_d, train_loss_sce, test_loss, test_loss_d, train_auc, train_eer, test_auc, test_eer = accelerator.prepare(
+        loss_object, loss_object_sce, train_loss, train_loss_d, train_loss_sce, test_loss, test_loss_d, train_auc, train_eer, test_auc, test_eer
+    )
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers("logs")
+
+    # Train!
+    logger.info("***** Running training *****")
+    logger.info(f"  Epochs = {args.epoch}")
+
+    # log config to the tracker
+    if accelerator.is_main_process:
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":                
+                for arg in vars(args):
+                    tracker.writer.add_text("config/" + str(arg), str(getattr(args, arg)))
+
+    global_step = 0
+    first_epoch = 0
+
+    for epoch in range(first_epoch, args.epoch):
+        model.train()
+        progress_bar = tqdm(
+            range(int(args.epoch * train_len/(args.batch_size * accelerator.num_processes))),
+            initial=global_step,
+            desc="Epoch {}".format(epoch),
+            # Only show the progress bar once on each machine.
+            disable=not accelerator.is_local_main_process,
+        )
+        for batch_idx, batch in enumerate(train_dataloader):
+            optimizer.zero_grad()
+            if args.audio_input == "raw":
+                if args.audio_noise:
+                    prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model(batch["x_noisy"], batch["y"], batch["x_len"], batch["y_len"])
+                else:
+                    prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model(batch["x"], batch["y"], batch["x_len"], batch["y_len"])
+            elif args.audio_input == "google_embed":
+                prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model(batch["gemb"], batch["y"], batch["gemb_len"], batch["y_len"])
+            elif args.audio_input == "both":
+                if args.audio_noise:
+                    prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model((batch["x_noisy"], batch["gemb"]), batch["y"], (batch["x_len"], batch["gemb_len"]), batch["y_len"])
+                else:
+                    prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model((batch["x"], batch["gemb"]), batch["y"], (batch["x_len"], batch["gemb_len"]), batch["y_len"])
+            else:
+                raise NotImplementedError
+
+            loss, LD, LC = loss_object_sce(batch['z'], LD, batch['l'], batch['t'], seq_logit, seq_logit_mask)
+            loss /= args.batch_size
+            LD /= args.batch_size
+            LC /= args.batch_size
+            train_auc.update(prob.detach(), batch['z'].detach())
+            train_eer.update(batch['z'].detach(), prob.detach())
+            
+            if batch_idx == 0:
+                if accelerator.is_main_process:
+                    for tracker in accelerator.trackers:
+                        if tracker.name == "tensorboard":                
+                            match_idx = torch.where(batch['z'] == 0, 1, 0).nonzero().reshape(-1)
+                            unmatch_idx = torch.where(batch['z'] != 0, 1, 0).nonzero().reshape(-1)
+                            match_affn = affinity_matrix[match_idx[:5]].unsqueeze(-1)
+                            unmatch_affn = affinity_matrix[unmatch_idx[:5]].unsqueeze(-1)
+                            tracker.writer.add_images("affinity/match", match_affn.detach().cpu().numpy(), epoch, dataformats="NHWC")
+                            tracker.writer.add_images("affinity/unmatch", unmatch_affn.detach().cpu().numpy(), epoch, dataformats="NHWC")
+                        else:
+                            raise NotImplementedError
+                        
+            loss.backward()
+            optimizer.step()
+
+            train_loss.update(loss.item())
+            train_loss_d.update(LD.item())
+            train_loss_sce.update(LC.item())
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                accelerator.log({
+                    "epoch": epoch,
+                    "train/loss/total": train_loss.compute().detach().item(), 
+                    "train/loss/d": train_loss_d.compute().detach().item(), 
+                    "train/loss/sce": train_loss_sce.compute().detach().item(),
+                    "train/auc": train_auc.compute().detach().item(), 
+                    "train/eer": train_eer.compute().detach().item(), 
+                    }, 
+                                 step=global_step)
+
+            logs = {"train_loss": train_loss.compute().detach().item(),
+                    "train_loss_d": train_loss_d.compute().detach().item(), 
+                    "train_loss_sce": train_loss_sce.compute().detach().item(),
+                    }
+            progress_bar.set_postfix(**logs)
         
-        template = ("Epoch {} | TRAIN | Loss {:.3f}, AUC {:.2f}, EER {:.2f} | EER | G {:.2f}, Q {:.2f}, LE {:.2f}, LH {:.2f} | AUC | G {:.2f}, Q {:.2f}, LE {:.2f}, LH {:.2f} |")
-        print (template.format(epoch + 1, 
-                                train_loss.result(),
-                                train_auc.result() * 100,
-                                train_eer.result() * 100,
-                                google_eer.result() * 100,                        
-                                qualcomm_eer.result() * 100,
-                                test_easy_eer.result() * 100,
-                                test_hard_eer.result() * 100,
-                                google_auc.result() * 100,
-                                qualcomm_auc.result() * 100,
-                                test_easy_auc.result() * 100,
-                                test_hard_auc.result() * 100,
-                            )
-               )
+        # --- End of one epoch ---
+        logger.info("Train auc: {}".format(train_auc.compute().detach().item()))
+        logger.info("Train eer: {}".format(train_eer.compute().detach().item()))
 
-        train_loss.reset_states()
-        test_loss.reset_states()
-        train_auc.reset_states()
-        test_auc.reset_states()
-        test_easy_auc.reset_states()
-        test_hard_auc.reset_states()
-        train_eer.reset_states()
-        test_eer.reset_states()
-        test_easy_eer.reset_states()
-        test_hard_eer.reset_states()
-        google_eer.reset_states()
-        qualcomm_eer.reset_states()
-        google_auc.reset_states()
-        qualcomm_auc.reset_states()
+        train_loss.reset()
+        train_loss_d.reset()
+        train_loss_sce.reset()
+        train_auc.reset()
+        train_eer.reset()
+
+        logger.info(
+            f"Running validation..."
+        )
+
+        model.eval()
+        
+        for loader_idx, loader in enumerate(tqdm(eval_dataloader, disable=not accelerator.is_local_main_process,)):
+            for batch_idx, batch in enumerate(tqdm(loader, desc="loader_idx={}".format(loader_idx), disable=not accelerator.is_local_main_process,)):
+                with torch.no_grad():
+                    if args.audio_input == "raw":
+                        prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model(batch["x"], batch["y"], batch["x_len"], batch["y_len"])
+                    elif args.audio_input == "google_embed":
+                        prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model(batch["gemb"], batch["y"], batch["gemb_len"], batch["y_len"])
+                    elif args.audio_input == "both":
+                        prob, affinity_matrix, LD, seq_logit, affinity_mask, seq_logit_mask = model((batch["x"], batch["gemb"]), batch["y"], (batch["x_len"], batch["gemb_len"]), batch["y_len"])
+                    else:
+                        raise NotImplementedError
+                    
+                    t_loss, LD = loss_object(batch['z'], LD)
+                    t_loss /= args.batch_size
+                    LD /= args.batch_size
+                    
+                    test_loss.update(t_loss.item())
+                    test_loss_d.update(LD.item())
+                    test_auc.update(prob.detach(), batch['z'].detach())
+                    test_eer.update(batch['z'].detach(), prob.detach())
+
+            logger.info(
+                f"Logging validation results..."
+            )
+
+            accelerator.log({
+                "val/{}/total".format(loader_idx): test_loss.compute().detach().item(),
+                "val/{}/d".format(loader_idx): test_loss_d.compute().detach().item(),
+                "val/{}/auc".format(loader_idx): test_auc.compute().detach().item(),
+                "val/{}/eer".format(loader_idx): test_eer.compute().detach().item(),
+                }, 
+                            step=global_step)
+            
+            test_loss.reset()
+            test_loss_d.reset()
+            test_auc.reset()
+            test_eer.reset()
+
+            logger.info(
+                f"One validation finished..."
+            )
+
+        # Save checkpoing
+        # ckpt_dir = f"checkpoint/epoch_{epoch}"
+        # ckpt_dir = os.path.join(args.output_dir, ckpt_dir)
+        # accelerator.save_state(ckpt_dir)
+
+    accelerator.wait_for_everyone()
+    return
+
+
+if __name__=="__main__":
+    main()

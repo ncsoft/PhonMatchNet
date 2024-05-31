@@ -1,6 +1,14 @@
 import math
-import tensorflow as tf
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+
+
+def sequence_mask(length, max_length=None):
+  if max_length is None:
+    max_length = length.max()
+  x = torch.arange(max_length, dtype=length.dtype, device=length.device)
+  return x.unsqueeze(0) < length.unsqueeze(1)
+
 
 def make_adjacency_matrix(speech_mask, text_mask):
     """
@@ -9,19 +17,21 @@ def make_adjacency_matrix(speech_mask, text_mask):
     text_mask   : [B, Lt]
     """
     # [B, L] -> [B]
-    n_speech = tf.math.reduce_sum(tf.cast(speech_mask, tf.float32), -1)
-    n_text = tf.math.reduce_sum(tf.cast(text_mask, tf.float32), -1)
+    n_speech = torch.sum(speech_mask, -1)
+    n_text = torch.sum(text_mask, -1)
+    
     n_node = n_speech + n_text
-    max_len = tf.math.reduce_max(n_node)
+    max_len = torch.max(n_node)
+
     # [B] -> [B, max_len] -> [B, max_len, 1] * [B, 1, max_len]-> [B, max_len, max_len]
-    mask = tf.sequence_mask(n_node, maxlen=max_len, dtype=tf.float32)
-    mask = tf.expand_dims(mask, -1) * tf.expand_dims(mask, 1)
+    mask = sequence_mask(n_node, max_length=max_len)
+    mask = mask.unsqueeze(-1) * mask.unsqueeze(1)
     # Make upper triangle matrix for adj. matrix
-    adjacency_matrix = tf.linalg.band_part(mask, -1, 0)
+    adjacency_matrix = torch.tril(mask)
     
     return adjacency_matrix
 
-def make_feature_matrix(speech_features, speech_mask, text_features, text_mask):
+def make_feature_matrix(speech_features, text_features, speech_mask, text_mask):
     """
     args
     speech_features : [B, Ls, F]
@@ -29,17 +39,22 @@ def make_feature_matrix(speech_features, speech_mask, text_features, text_mask):
     text_features   : [B, Lt, F]
     text_mask       : [B, Lt]
     """
-    # Data pre-processing
-    speech_mask = tf.cast(speech_mask, tf.float32)
-    text_mask = tf.cast(text_mask, tf.float32)
-    speech_seq_mask = tf.tile(tf.expand_dims(speech_mask, -1), tf.constant([1, 1, speech_features.shape[-1]], tf.int32))
-    text_seq_mask = tf.tile(tf.expand_dims(text_mask, -1), tf.constant([1, 1, text_features.shape[-1]], tf.int32))
-    speech_features *= speech_seq_mask
-    text_features *= text_seq_mask
-    
     # Concatenate two feature matrix along time axis
-    feature_matrix = tf.concat([speech_features, text_features], axis=1)
-    feature_mask = tf.concat([speech_mask, text_mask], axis=-1)
+    feature_matrix = torch.cat((speech_features, text_features), dim=1) 
+    feature_mask = torch.cat((speech_mask, text_mask), dim=1)
     
-    # Gather valid data using mask : tensor -> ragged tensor -> tensor
-    return tf.ragged.boolean_mask(feature_matrix, tf.cast(feature_mask, tf.bool)).to_tensor(0.)
+    n_speech = torch.sum(speech_mask, -1)
+    n_text = torch.sum(text_mask, -1)
+    
+    n_node = n_speech + n_text
+    max_len = torch.max(n_node)
+    
+    # Gather valid data using mask
+    # [Warning] This returns a ragged tensor
+    # Results are different with "feature_matrix * feature_mask.unsqueeze(-1)"
+    indices = torch.masked_fill(torch.cumsum(feature_mask.int(), dim=1), ~feature_mask, 0)
+    masked = torch.zeros(feature_matrix.shape[0], feature_matrix.shape[1]+1, feature_matrix.shape[2]).to(feature_matrix.device)
+    masked = torch.scatter(input=masked, dim=1, index=torch.stack([indices for _ in range(feature_matrix.shape[-1])], dim=-1), src=feature_matrix)
+    masked = masked[:,1:max_len+1]
+
+    return masked

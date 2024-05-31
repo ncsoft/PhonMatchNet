@@ -1,176 +1,209 @@
-import tensorflow as tf
+import torch
+import torch.nn as nn
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras import layers
 
 seed = 42
-tf.random.set_seed(seed)
+torch.random.manual_seed(seed)
 np.random.seed(seed)
 
-class Encoder(Model):
+
+class Encoder(nn.Module):
     """Base class for encoders"""
     
-    def __init__(self, name="Encoder", **kwargs):
-        super(Encoder, self).__init__(name=name)
+    def __init__(self, **kwargs):
+        super().__init__()
 
-    def call(self, src, src_len=None):
+    def forward(self, src, src_mask=None):
         """
         Args:
-            src     : source of shape `(batch, src_len)`
-            src_len : lengths of each source of shape `(batch)`
+            src      : source of shape `(batch, src_len)`
+            src_mask : mask indicating the lengths of each source of shape `(batch, time)`
         """
         raise NotImplementedError
+
 
 class AudioEncoder(Encoder):
     """Base class for audio encoders"""
     
-    def __init__(self, name="BaseAudioEncoder", **kwargs):
-        super(AudioEncoder, self).__init__(name=name)
-        
-        self.crnn = []
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.cnn = []
+        self.rnn = []
+        self.strides = [1]
         self.stride = 1
+        last_input_features = kwargs['input_dim']
         if kwargs['audio_input'] == 'raw':
             for l in kwargs['conv']:
-                f, k, s = l
-                self.crnn.append(layers.Conv1D(f, k, s, padding='same'))
-                self.crnn.append(layers.BatchNormalization())
-                self.crnn.append(layers.ReLU())
+                o, k, s, p = l
+                self.cnn.append(nn.Conv1d(last_input_features, o, k, stride=s, padding=p)) # Torch does not support 'same' padding for stride > 1
+                self.cnn.append(nn.BatchNorm1d(o))
+                self.cnn.append(nn.ReLU())
                 self.stride *= s
+                self.strides.append(self.stride)
+                last_input_features = o
+
             for l in kwargs['gru']:
                 unit = l
-                self.crnn.append(layers.GRU(unit[0], return_sequences=True))
+                self.rnn.append(nn.GRU(last_input_features, unit[0], batch_first=True))
+                last_input_features = unit[0]
 
-        self.dense = layers.Dense(kwargs['fc'])
-        self.act = layers.LeakyReLU()
-            
-    def call(self, src):
+        self.cnn = nn.ModuleList(self.cnn)
+        self.rnn = nn.ModuleList(self.rnn)
+
+        self.dense = nn.Linear(last_input_features, kwargs['fc'])
+        self.act = nn.LeakyReLU()
+
+    
+    def forward(self, src, src_mask=None, verbose=False):
         """
         Args:
             src         : source of shape `(batch, time, feature)`
-            src_len     : lengths of each source of shape `(batch)`
+            src_mask    : mask indicating the lengths of each source of shape `(batch, time)`
         """
         # keep the batch mask
-        mask_flag = 'mask' in vars(src)
-        if mask_flag:
-            mask = src.mask[:,::self.stride]
-
-        x = src
-        for layer in self.crnn:
-            # [B, T, F] -> [B, T/2, Conv1D] -> [B, T/2, GRU]
-            if isinstance(layer, layers.GRU):
-                if mask_flag:
-                    x = layer(x, mask=mask)
-                else:
-                    x = layer(x)
-            else:
-                x = layer(x)
-        # [B, T/2, Dense]
-        x = self.dense(x)
+        if src_mask is not None:
+            mask = src_mask[:,::self.stride]
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(-1)
+        else:
+            mask = None
+        
+        # [B, T, F]
+        # cnn
+        x = src.transpose(1, 2)
+        for i, layer in enumerate(self.cnn): # [B, F, T] -> [B, Conv1d, T/self.stride]
+            x = layer(x)
+        x = x.transpose(1, 2)
+        
+        # rnn
+        hidden = None
+        for layer in self.rnn: # [B, T/self.stride, Conv1D] -> [B, T/self.stride, GRU]
+            if mask is not None:
+                x = x * mask
+            x, hidden = layer(x, hidden)
+        
+        x = self.dense(x)      # [B, T/self.stride, Dense]
+        
         LD = x
         x = self.act(x)
-        if mask_flag:
-            x._keras_mask = mask
         
-        return x, LD
-    
+        x = torch.nan_to_num(x) * mask
+        mask = mask.squeeze(-1)
+
+        return x, LD, mask
+
+
 class EfficientAudioEncoder(Encoder):
     """Efficient encoder class for audio encoders"""
     
-    def __init__(self, name="EfficientAudioEncoder", downsample=True, **kwargs):
-        super(EfficientAudioEncoder, self).__init__(name=name)
+    def __init__(self, downsample=True, **kwargs):
+        super().__init__()
         self.downsample = downsample
-        self.layer = []
-        
+        self.layer = [] 
+        self.deConv = None
+        last_input_features = kwargs['input_dim']
+
         if self.downsample:
-            for _ in range(2):
-                self.layer.append(layers.Conv1D(kwargs['fc'], 5, 2, padding='same'))
-                self.layer.append(layers.BatchNormalization())
-                self.layer.append(layers.ReLU())
-                self.layer.append(layers.MaxPool1D(pool_size=2, strides=2, padding='valid'))
-            self.layer = self.layer[:-1]
+            self.layer.append(nn.Conv1d(last_input_features, kwargs['fc'], 5, stride=2, padding=2))
+            self.layer.append(nn.BatchNorm1d(kwargs['fc']))
+            self.layer.append(nn.ReLU())
+            self.layer.append(nn.MaxPool1d(2))
+            self.layer.append(nn.Conv1d(kwargs['fc'], kwargs['fc'], 5, stride=2, padding=2))
+            self.layer.append(nn.BatchNorm1d(kwargs['fc']))
+            self.layer.append(nn.ReLU())
+            self.dense = nn.Linear(96, kwargs['fc'])
         else:
-            self.layer.append(layers.Conv1D(kwargs['fc'], 3, 2, padding='same'))
-            self.layer.append(layers.BatchNormalization())
-            self.layer.append(layers.ReLU())
-            self.layer.append(layers.Conv1D(kwargs['fc'], 3, 1, padding='same'))
-            self.layer.append(layers.BatchNormalization())
-            self.layer.append(layers.ReLU())
-            self.deConv = layers.Conv1DTranspose(kwargs['fc'], 5, 4)
+            self.layer.append(nn.Conv1d(last_input_features, kwargs['fc'], 3, stride=2, padding=1))
+            self.layer.append(nn.BatchNorm1d(kwargs['fc']))
+            self.layer.append(nn.ReLU())
+            self.layer.append(nn.Conv1d(kwargs['fc'], kwargs['fc'], 3, stride=1, padding=1))
+            self.layer.append(nn.BatchNorm1d(kwargs['fc']))
+            self.layer.append(nn.ReLU())
+            self.deConv = nn.ConvTranspose1d(96, kwargs['fc'], 5, 4) # 96: MAGIC NUM defined by google speech embedding
+        self.layer = nn.Sequential(*self.layer)
         
-        self.dense = layers.Dense(kwargs['fc'])
-        self.act = layers.LeakyReLU()
-            
-    def call(self, specgram, embed):
+        self.act = nn.LeakyReLU()
+
+    def forward(self, src, src_mask=None, verbose=False):
         """
         Args:
-            embed       : google speech embedding of shape `(batch, time / 8, 96)`
-            specgram    : log mel-spectrogram of shape `(batch, time, mel)`
-        """
-        # keep the batch mask
-        mask_flag = 'mask' in vars(embed)
-        
-        if mask_flag:
-            if self.downsample:
-                mask = specgram.mask[:,::8]
-            else:
-                mask = specgram.mask[:,::2]
+            src         : (spectrogram, gembed) where
+                        : spectrogram - log mel-spectrogram of shape `(batch, time, mel)`
+                        : gembed      - google speech embedding of shape `(batch, time / 8, 96)`
+            src_mask    : mask indicating the lengths of spectrogram of shape `(batch, time)`
+        """        
+        spectrogram, gembed = src
 
-        x = specgram
-        for l in self.layer:
-            # [B, T, F] -> [B, T/8, dense] or [B, T/2, dense]
-            x = l(x)
+        if src_mask is not None:
+            s_mask, g_mask = src_mask
+            if self.downsample:
+                mask = s_mask[:,::8]
+            else:
+                mask = s_mask[:,::2]
+            gembed = torch.nan_to_num(gembed) * g_mask.unsqueeze(-1)
+        else:
+            mask = None
+
+        x = spectrogram.transpose(1, 2)
+        x = self.layer(x)
+        x = x.transpose(1, 2)
 
         LD = x
-        
+
         # [B, T/8, dense] or [B, T/2, dense]
         if self.downsample:
-            y = self.act(self.dense(embed))
-            
-            # Summation two embedding
-            x += tf.pad(y, [[0, 0],[0, tf.shape(x)[1] - tf.shape(y)[1]],[0, 0]], 'CONSTANT', constant_values=0.0)
-        else:
-            y = self.act(self.deConv(embed))
-            if tf.shape(x)[1] > tf.shape(y)[1]:
-                x += tf.pad(y, [[0, 0],[0, tf.shape(x)[1] - tf.shape(y)[1]],[0, 0]], 'CONSTANT', constant_values=0.0)
-            elif tf.shape(x)[1] < tf.shape(y)[1]:
-                x += y[:, :x.shape[1], :]
+            y = self.act(self.dense(gembed))
 
-        if mask_flag:
-            x._keras_mask = mask
-            LD._keras_mask = mask
-            
-        return x, LD
+            # Summation two embedding
+            x = x + nn.functional.pad(y, (0, 0, 0, x.shape[1] - y.shape[1], 0, 0), value=0.0)
+        else:
+            y = gembed.transpose(1, 2)
+            y = self.act(self.deConv(y))
+            y = y.transpose(1, 2)
+
+            if x.shape[1] > y.shape[1]:
+                x = x + nn.functional.pad(y, (0, 0, 0, x.shape[1] - y.shape[1], 0, 0), value=0.0)
+            elif x.shape[1] < y.shape[1]:
+                x = x + y[:, :x.shape[1], :]
+            else:
+                x = x + y
+        
+        x = torch.nan_to_num(x) * mask.unsqueeze(-1)
+        LD = torch.nan_to_num(LD) * mask.unsqueeze(-1)
+
+        return x, LD, mask
+
 
 class TextEncoder(Encoder):
     """Base class for text encoders"""
     
-    def __init__(self, name="BaseTextEncoder", **kwargs):
-        super(TextEncoder, self).__init__(name=name)
+    def __init__(self, **kwargs):
+        super().__init__()
         
         self.features = kwargs['text_input']
+        self.vocab = kwargs['vocab']
         if self.features == 'phoneme':
-            self.mask = tf.keras.layers.Masking(mask_value=0, input_shape=(None,))
-            vocab = tf.convert_to_tensor(kwargs['vocab'], dtype=tf.int32)
-            self.one_hot = layers.Lambda(lambda x: tf.one_hot(x, vocab), dtype=tf.int32, name='ont_hot')
+            self.dense = nn.Linear(kwargs['vocab'], kwargs['fc'])
         elif self.features == 'g2p_embed':
-            self.mask = tf.keras.layers.Masking(mask_value=0, input_shape=(None, 256))
-        self.dense = layers.Dense(kwargs['fc'])
-        self.act = layers.LeakyReLU()
+            self.dense = nn.Linear(256, kwargs['fc'])
+        self.act = nn.LeakyReLU()
 
-    def call(self, src):
+    def forward(self, src, verbose=False):
         """
         Args:
-            src         : phoneme token of shape `(batch, phoneme)`
-            src_len     : lengths of each source of shape `(batch)`
+            src         : phoneme token of shape `(batch, phoneme, *)`
+                        : [WARNING] for 'g2p_embed' features, shape is `(batch, phoneme, 256)`
+            src_mask    : mask indicating the lengths of each source of shape `(batch, time)`
         """
         # [B, phoneme] -> [B, phoneme, embedding]
-        mask = self.mask(src)
+        x = src
+        src_mask = (src != 0.0)
+        if src_mask.dim() == 3:
+            src_mask = src_mask[:,:,0]
+        
         if self.features == 'phoneme':
-            x = self.one_hot(src)
-        elif self.features == 'g2p_embed':
-            x = src
-            mask = mask[:,:,0]
+            x = nn.functional.one_hot(x.to(torch.int64), num_classes=self.vocab).to(torch.float)
         x = self.act(self.dense(x))
-        x._keras_mask = tf.cast(mask, tf.bool)
+        x = torch.nan_to_num(x) * src_mask.unsqueeze(-1)
 
-        return x
+        return x, src_mask

@@ -5,24 +5,19 @@ import pandas as pd
 import Levenshtein
 from multiprocessing import Pool
 from scipy.io import wavfile
-import tensorflow as tf
-
-from tensorflow.keras.utils import Sequence, OrderedEnqueuer
-from tensorflow.keras import layers
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import torch
+import torch.nn as nn
 
 sys.path.append(os.path.dirname(__file__))
 from g2p.g2p_en.g2p import G2p
 
-import warnings
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
-np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
-class LibriPhraseDataloader(Sequence):
+class LibriPhraseDataset(torch.utils.data.Dataset):
     def __init__(self, 
                  batch_size,
                  fs = 16000,
                  wav_dir='/home/DB/LibriPhrase_diffspk_all',
+                 gemb_dir=None,
                  noise_dir='/home/DB/noise',
                  csv_dir='/home/DB/LibriPhrase/data',
                  train_csv = ['train_100h', 'train_360h'],
@@ -33,6 +28,8 @@ class LibriPhraseDataloader(Sequence):
                  shuffle=True,
                  pkl=None,
                  edit_dist=False,
+                 frame_length=None,
+                 hop_length=None,
                  ):
         
         phonemes = ["<pad>", ] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
@@ -49,7 +46,8 @@ class LibriPhraseDataloader(Sequence):
         
         self.batch_size = batch_size
         self.fs = fs
-        self.wav_dir = wav_dir 
+        self.wav_dir = wav_dir  
+        self.gemb_dir = gemb_dir
         self.csv_dir = csv_dir
         self.noise_dir = noise_dir
         self.train_csv = train_csv
@@ -60,6 +58,8 @@ class LibriPhraseDataloader(Sequence):
         self.shuffle = shuffle
         self.pkl = pkl
         self.edit_dist = edit_dist
+        self.frame_length = frame_length
+        self.hop_length = hop_length
         self.nPhoneme = len(phonemes)
         self.g2p = G2p()
         
@@ -101,10 +101,10 @@ class LibriPhraseDataloader(Sequence):
                     com_pos['label'] = 1
                     com_pos['type'] = df['type']
                     # Concat
-                    self.data = self.data.append(anc_pos.rename(columns={y: x for x, y in zip(self.data.columns, anc_pos.columns)}), ignore_index=True)
-                    self.data = self.data.append(anc_neg.rename(columns={y: x for x, y in zip(self.data.columns, anc_neg.columns)}), ignore_index=True)
-                    self.data = self.data.append(com_pos.rename(columns={y: x for x, y in zip(self.data.columns, com_pos.columns)}), ignore_index=True)
-                    self.data = self.data.append(com_neg.rename(columns={y: x for x, y in zip(self.data.columns, com_neg.columns)}), ignore_index=True)
+                    self.data = pd.concat([self.data, anc_pos.rename(columns={y: x for x, y in zip(self.data.columns, anc_pos.columns)})], ignore_index=True)
+                    self.data = pd.concat([self.data, anc_neg.rename(columns={y: x for x, y in zip(self.data.columns, anc_neg.columns)})], ignore_index=True)
+                    self.data = pd.concat([self.data, com_pos.rename(columns={y: x for x, y in zip(self.data.columns, com_pos.columns)})], ignore_index=True)
+                    self.data = pd.concat([self.data, com_neg.rename(columns={y: x for x, y in zip(self.data.columns, com_neg.columns)})], ignore_index=True)
 
             # Append wav directory path
             self.data['wav'] = self.data['wav'].apply(lambda x: os.path.join(self.wav_dir, x))
@@ -150,8 +150,7 @@ class LibriPhraseDataloader(Sequence):
         self.maxlen_l = int((int(self.data['wav_label'].apply(lambda x: len(x)).max() / 10) + 1) * 10)
                             
     def __len__(self):
-        # return total batch-wise length
-        return math.ceil(self.len / self.batch_size)
+        return self.len
 
     def _load_wav(self, wav):
         return np.array(wavfile.read(wav)[1]).astype(np.float32) / 32768.0
@@ -163,10 +162,10 @@ class LibriPhraseDataloader(Sequence):
             return noise_rms
 
         def _cal_rms(amp):
-            return np.sqrt(np.mean(np.square(amp), axis=-1))
+            return torch.sqrt(torch.mean(torch.square(amp), axis=-1))
         
-        start = np.random.randint(0, len(self.noise)-len(clean))
-        divided_noise = self.noise[start: start + len(clean)]
+        start = torch.randint(0, len(self.noise)-len(clean), size=(1,))
+        divided_noise = torch.Tensor(self.noise[start: start + len(clean)]).to(torch.float32)
         clean_rms = _cal_rms(clean)
         noise_rms = _cal_rms(divided_noise)
         adj_noise_rms = _cal_adjusted_rms(clean_rms, np.random.randint(snr[0], snr[1]))
@@ -174,158 +173,120 @@ class LibriPhraseDataloader(Sequence):
         adj_noise_amp = divided_noise * (adj_noise_rms / (noise_rms + 1e-7)) 
         noisy = clean + adj_noise_amp
         
-        if np.max(noisy) > 1:
-            noisy = noisy / np.max(noisy)
+        if torch.max(noisy) > 1:
+            noisy = noisy / torch.max(noisy)
         
         return noisy
     
     def __getitem__(self, idx):
         # chunking
-        indices = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        i = self.indices[idx]
         
         # load inputs
-        batch_x = [np.array(wavfile.read(self.wav_list[i])[1]).astype(np.float32) / 32768.0 for i in indices]
+        x = torch.Tensor(wavfile.read(self.wav_list[i])[1]).to(torch.float32) / 32768.0
         if self.features == 'both':
-            batch_p = [np.array(self.idx_list[i]).astype(np.int32) for i in indices]
-            batch_e = [np.array(self.emb_list[i]).astype(np.float32) for i in indices]
+            p = torch.Tensor(self.idx_list[i]).to(torch.int32)
+            e = torch.Tensor(self.emb_list[i]).to(torch.float32)
         else:
             if self.features == 'phoneme':
-                batch_y = [np.array(self.idx_list[i]).astype(np.int32) for i in indices]
+                y = torch.Tensor(self.idx_list[i]).to(torch.int32)
             elif self.features == 'g2p_embed':
-                batch_y = [np.array(self.emb_list[i]).astype(np.float32) for i in indices]
-        # load outputs
-        batch_z = [np.array([self.lab_list[i]]).astype(np.float32) for i in indices]
-        batch_l = [np.array(self.sIdx_list[i]).astype(np.int32) for i in indices]
-        batch_t = [np.array(self.idx_list[i]).astype(np.int32) for i in indices]
-        if self.edit_dist:
-            batch_d = [np.array([self.dist_list[i]]).astype(np.float32) for i in indices]
-
-        # padding and masking
-        pad_batch_x = pad_sequences(np.array(batch_x), maxlen=self.maxlen_a, value=0.0, padding='post', dtype=batch_x[0].dtype)
-        if self.features == 'both':
-            pad_batch_p = pad_sequences(np.array(batch_p), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_p[0].dtype)
-            pad_batch_e = pad_sequences(np.array(batch_e), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_e[0].dtype)
-        else:
-            pad_batch_y = pad_sequences(np.array(batch_y), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_y[0].dtype)
-        pad_batch_z = pad_sequences(np.array(batch_z), value=0.0, padding='post', dtype=batch_z[0].dtype)
-        pad_batch_l = pad_sequences(np.array(batch_l), maxlen=self.maxlen_l, value=0.0, padding='post', dtype=batch_l[0].dtype)
-        pad_batch_t = pad_sequences(np.array(batch_t), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_t[0].dtype)
-        if self.edit_dist:
-            pad_batch_d = pad_sequences(np.array(batch_d), value=0.0, padding='post', dtype=batch_d[0].dtype)
+                y = torch.Tensor(self.emb_list[i]).to(torch.float32)
         
+        # load outputs
+        z = torch.Tensor([self.lab_list[i]]).to(torch.float32)
+        l = torch.Tensor(self.sIdx_list[i]).to(torch.int32)
+        t = torch.Tensor(self.idx_list[i]).to(torch.int32)
+        if self.edit_dist:
+            d = torch.Tensor([self.dist_list[i]]).to(torch.float32)
+
         # Noisy option
         if self.train:
-            batch_x_noisy = [self._mixing_snr(x) for x in batch_x]
-            pad_batch_x_noisy = pad_sequences(np.array(batch_x_noisy), maxlen=self.maxlen_a, value=0.0, padding='post', dtype=batch_x_noisy[0].dtype)
+            x_noisy = self._mixing_snr(x)
         
+        if self.gemb_dir is not None:
+            file_dirs = os.path.splitext(self.wav_list[i])[0]
+            file_dirs = file_dirs.split("/")
+            filepath = file_dirs[-1] + '.npy'
+            dirpath = os.path.join(*file_dirs[3:-1])
+            gemb = torch.from_numpy(np.load(os.path.join(self.gemb_dir, dirpath, filepath))[0]).to(torch.float32)
+        else:
+            gemb = None
+            
         if self.train:
             if self.features == 'both':
-                return pad_batch_x, pad_batch_x_noisy, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_l, pad_batch_t
+                return {"x": x, "x_noisy": x_noisy, "gemb": gemb, "y": None, "p": p, "e": e, "z": z, "l": l, "t": t, "d": None,}
             else:
-                return pad_batch_x, pad_batch_x_noisy, pad_batch_y, pad_batch_z, pad_batch_l, pad_batch_t
+                return {"x": x, "x_noisy": x_noisy, "gemb": gemb, "y": y, "p": None, "e": None, "z": z, "l": l, "t": t, "d": None,}
         else:
             if self.features == 'both':
                 if self.edit_dist:
-                    return pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_d
+                    return {"x": x, "x_noisy": None, "gemb": gemb, "y": None, "p": p, "e": e, "z": z, "l": None, "t": None, "d": d,}
                 else:
-                    return pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z
+                    return {"x": x, "x_noisy": None, "gemb": gemb, "y": None, "p": p, "e": e, "z": z, "l": None, "t": None, "d": None,}
             else:
                 if self.edit_dist:
-                    return pad_batch_x, pad_batch_y, pad_batch_z, pad_batch_d
+                    return {"x": x, "x_noisy": None, "gemb": gemb, "y": y, "p": None, "e": None, "z": z, "l": None, "t": None, "d": d,}
                 else:
-                    return pad_batch_x, pad_batch_y, pad_batch_z
+                    return {"x": x, "x_noisy": None, "gemb": gemb, "y": y, "p": None, "e": None, "z": z, "l": None, "t": None, "d": None,}
 
     def on_epoch_end(self):
         self.indices = np.arange(self.len)
         if self.shuffle == True:
             np.random.shuffle(self.indices)
 
-def convert_sequence_to_dataset(dataloader):
-    def data_generator():
-        for i in range(dataloader.__len__()):
-            if dataloader.train:
-                if dataloader.features == 'both':
-                    pad_batch_x, pad_batch_x_noisy, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_l, pad_batch_t = dataloader[i]
-                    yield pad_batch_x, pad_batch_x_noisy, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_l, pad_batch_t
-                else:
-                    pad_batch_x, pad_batch_x_noisy, pad_batch_y, pad_batch_z, pad_batch_l, pad_batch_t = dataloader[i]
-                    yield pad_batch_x, pad_batch_x_noisy, pad_batch_y, pad_batch_z, pad_batch_l, pad_batch_t
-            else:
-                if dataloader.features == 'both':
-                    if dataloader.edit_dist:
-                        pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_d = dataloader[i]
-                        yield pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z, pad_batch_d
-                    else:
-                        pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z = dataloader[i]
-                        yield pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z
-                else:
-                    if dataloader.edit_dist:
-                        pad_batch_x, pad_batch_y, pad_batch_z, pad_batch_d = dataloader[i]
-                        yield pad_batch_x, pad_batch_y, pad_batch_z, pad_batch_d
-                    else:
-                        pad_batch_x, pad_batch_y, pad_batch_z = dataloader[i]
-                        yield pad_batch_x, pad_batch_y, pad_batch_z
-    
-    if dataloader.train:
-        if dataloader.features == 'both':
-            data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_t, 256), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_l), dtype=tf.int32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),)
-            )
-        else:
-            data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_t) if dataloader.features == 'phoneme' else (None, dataloader.maxlen_t, 256),
-                            dtype=tf.int32 if dataloader.features == 'phoneme' else tf.float32),
-                tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_l), dtype=tf.int32),
-                tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),)
-            )
-    else:
-        if dataloader.features == 'both':
-            if dataloader.edit_dist:
-                data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t, 256), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-                )
-            else:
-                data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t, 256), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-                )
-        else:
-            if dataloader.edit_dist:
-                data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t) if dataloader.features == 'phoneme' else (None, dataloader.maxlen_t, 256),
-                                dtype=tf.int32 if dataloader.features == 'phoneme' else tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-                )
-            else:
-                data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-                    tf.TensorSpec(shape=(None, dataloader.maxlen_t) if dataloader.features == 'phoneme' else (None, dataloader.maxlen_t, 256),
-                                dtype=tf.int32 if dataloader.features == 'phoneme' else tf.float32),
-                    tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-                )
-    # data_dataset = data_dataset.cache()
-    data_dataset = data_dataset.prefetch(1)
-    
-    return data_dataset
+    def pad_sequence(self, data, max_len):
+        pad_list = [0 for _ in range(data[0].dim()*2)]
+        pad_list[-1] = max_len - data[0].shape[0]
+        data[0] = torch.nn.functional.pad(data[0], tuple(pad_list))
+        return torch.nn.utils.rnn.pad_sequence(data, batch_first=True)
 
-if __name__ == '__main__':
-    GLOBAL_BATCH_SIZE = 2048
-    train_dataset = LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, train=True, types='both', shuffle=True, pkl='/home/DB/LibriPhrase/data/train_both.pkl', features='g2p_embed')
-    test_dataset = LibriPhraseDataloader(batch_size=GLOBAL_BATCH_SIZE, train=False, edit_dist=True, types='both', shuffle=False, pkl='/home/DB/LibriPhrase/data/test_both.pkl', features='g2p_embed')
+    def collate(self, batch):
+        '''
+            batch = [{"x", "x_noisy", "gemb", "y", "p", "e", "z", "l", "t", "d",}]
+        '''
+        batch_dict = {
+            "x": None,          "x_len": None,
+            "x_noisy": None,    "x_noisy_len": None,
+            "gemb": None,       "gemb_len": None, 
+            "y": None,          "y_len": None,
+            "p": None,          "p_len": None,
+            "e": None,          "e_len": None,
+            "z": None,          "z_len": None,
+            "l": None,          "l_len": None,
+            "t": None,          "t_len": None,
+            "d": None,          "d_len": None,
+            }
+        
+        device = batch[0]["x"].device
+        batch_dict["x"] = self.pad_sequence([b["x"] for b in batch], self.maxlen_a)
+        batch_dict["z"] = torch.nn.utils.rnn.pad_sequence([b["z"] for b in batch], batch_first=True)
+        batch_dict["x_len"] = torch.Tensor([b["x"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        # batch_dict["z_len"] = torch.Tensor([b["z"].shape[0] for b in batch]).to(torch.int32) # always [1,1, ...]
+        
+        if self.features == 'both':
+            batch_dict["p"] = self.pad_sequence([b["p"] for b in batch], self.maxlen_t)
+            batch_dict["e"] = self.pad_sequence([b["e"] for b in batch], self.maxlen_t)
+            batch_dict["p_len"] = torch.Tensor([b["p"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+            batch_dict["e_len"] = torch.Tensor([b["e"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        else:
+            batch_dict["y"] = self.pad_sequence([b["y"] for b in batch], self.maxlen_t)
+            batch_dict["y_len"] = torch.Tensor([b["y"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        
+        if self.train:
+            batch_dict["x_noisy"] = self.pad_sequence([b["x_noisy"] for b in batch], self.maxlen_a)
+            batch_dict["l"] = self.pad_sequence([b["l"] for b in batch], self.maxlen_l)
+            batch_dict["t"] = self.pad_sequence([b["t"] for b in batch], self.maxlen_t)
+            # batch_dict["x_noisy_len"] = torch.Tensor([b["x_noisy"].shape[0] for b in batch]).to(torch.int32) # identical to x_len
+            batch_dict["l_len"] = torch.Tensor([b["l"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+            batch_dict["t_len"] = torch.Tensor([b["t"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        
+        if self.gemb_dir is not None:
+            batch_dict["gemb"] = self.pad_sequence([b["gemb"] for b in batch], int(int((self.maxlen_a - self.frame_length)/self.hop_length + 1)/8))
+            batch_dict["gemb_len"] = torch.Tensor([int(int((b["x"].shape[0] - self.frame_length)/self.hop_length + 1)/8) for b in batch]).to(dtype=torch.int32, device=device)
+        
+        elif self.edit_dist:
+            batch_dict["d"] = torch.nn.utils.rnn.pad_sequence([b["d"] for b in batch], batch_first=True)
+            batch_dict["d_len"] = torch.Tensor([b["d"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+
+        return batch_dict

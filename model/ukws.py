@@ -1,37 +1,35 @@
 import os, sys
-import tensorflow as tf
+import torch
 import numpy as np
-from tensorflow.keras.models import Model
-from tensorflow.keras import layers
+import torch.nn as nn
 
 sys.path.append(os.path.dirname(__file__))
-import encoder, extractor, discriminator, log_melspectrogram, speech_embedding
-from utils import make_feature_matrix as concat_sequence
+import encoder, extractor, discriminator, log_melspectrogram
+from utils import sequence_mask
 
 seed = 42
-tf.random.set_seed(seed)
+torch.random.manual_seed(seed)
 np.random.seed(seed)
 
-class ukws(Model):
+class ukws(nn.Module):
     """Base class for user-defined kws mdoel"""
-    
-    def __init__(self, name="ukws", **kwargs):
-        super(ukws, self).__init__(name=name)
+    def __init__(self, **kwargs):
+        super().__init__()
 
-    def call(self, speech, text):
+    def forward(self, speech, text, speech_len=None, text_len=None, ):
         """
         Args:
-            speech  : speech feature of shape `(batch, time)`
-            text    : text embedding of shape `(batch, phoneme)`
+            speech      : speech feature of shape `(batch, time, *)`
+            text        : text embedding of shape `(batch, phoneme, *)`
+            speech_len  : length of speech parameter of shape `(batch,)`
+            text_len    : length of text parameter of shape `(batch,)`
         """
         raise NotImplementedError
 
 class BaseUKWS(ukws):
-    """Base class for user-defined kws mdoel"""
-    
-    def __init__(self, name="BaseUKWS", **kwargs):
-        super(BaseUKWS, self).__init__(name=name)
-        embedding=128
+    def __init__(self, **kwargs):
+        super().__init__()
+        embedding = 128
         self.audio_input = kwargs['audio_input']
         self.text_input = kwargs['text_input']
         self.stack_extractor = kwargs['stack_extractor']
@@ -42,82 +40,115 @@ class BaseUKWS(ukws):
             'num_mel'  : kwargs['num_mel'] ,
             'sample_rate' : kwargs['sample_rate'],
             'log_mel' : kwargs['log_mel'],
+            'lin_to_mel_path' : "./model/lin_to_mel_matrix.npy",    
         }
+        if kwargs['audio_input'] == "google_embed":
+            input_dim = 96
+        else:
+            input_dim = kwargs['num_mel']
         _ae = {
-            # [filter, kernel size, stride]
-            'conv' : [[embedding, 5, 2], [embedding * 2, 5, 1]],
+            'input_dim' : input_dim,                                
+            # [filter, kernel size, stride, padding]
+            'conv' : [[embedding, 5, 2, 2], [embedding * 2, 5, 1, 2]],
             # [unit]
             'gru' : [[embedding], [embedding]],
             # fully-connected layer unit
-            'fc' : embedding,
+            'fc' : embedding,                                  
             'audio_input' : self.audio_input,
         }
         _te = {
             # fully-connected layer unit
             'fc' : embedding,
-            # number of uniq. phonemes
+            # number of uniq. phonemes         
             'vocab' : kwargs['vocab'],
             'text_input' : kwargs['text_input'],
         }
         _ext = {
             # [unit]
-            'embedding' : embedding,
+            'embedding' : embedding,    
+            'num_heads' : 1,
         }
         _dis = {
+            'input_dim' : embedding,
             # [unit]
-            'gru' : [[embedding],],
+            'gru' : [[embedding],],     
         }
-        if self.audio_input == 'both':
+
+        if self.audio_input == 'both':  # two-stream audio encoder
             self.SPEC = log_melspectrogram.LogMelgramLayer(**_stft)
-            self.EMBD = speech_embedding.GoogleSpeechEmbedder()
             self.AE = encoder.EfficientAudioEncoder(downsample=False, **_ae)
-        else:
+        else:                           # single-stream
             if self.audio_input == 'raw':
                 self.FEAT = log_melspectrogram.LogMelgramLayer(**_stft)
             elif self.audio_input == 'google_embed':
-                self.FEAT = speech_embedding.GoogleSpeechEmbedder()
+                pass
             self.AE = encoder.AudioEncoder(**_ae)
 
         self.TE = encoder.TextEncoder(**_te)
         
-        if kwargs['stack_extractor']:
-            self.EXT = extractor.StackExtractor(**_ext)
+        if kwargs['stack_extractor']: 
+            self.EXT = extractor.StackExtractor(**_ext)     # self-attention
         else:
-            self.EXT = extractor.BaseExtractor(**_ext)
+            self.EXT = extractor.BaseExtractor(**_ext)      # cross-attention
         
-        self.DIS = discriminator.BaseDiscriminator(**_dis)
+        self.DIS = discriminator.BaseDiscriminator(**_dis)  # Basic keyword discriminator
         
-        self.seq_ce_logit = layers.Dense(1, name='sequence_ce')
-        
-    def call(self, speech, text):
+        self.seq_ce_logit = nn.Linear(embedding, 1)         # Additional phoneme discriminator
+
+    def forward(self, speech, text, speech_len=None, text_len=None, verbose=False):
         """
         Args:
-            speech      : speech feature of shape `(batch, time)`
+            speech      : speech features
+                            - if self.audio_input == 'both', shape - `((batch, time, mel), (batch, time/8, 96))`
+                            - elif self.audio_input == 'raw', shape - `(batch, time, mel)`
+                            - elif self.audio_input == 'google_embed', shape - `(batch, time/8, 96)`
             text        : text embedding of shape `(batch, phoneme)`
+            speech_len  : length of speech parameter
+                            - if self.audio_input == 'both', shape - `((batch,), (batch,))`
+                            - else, shape - `(batch,)`
+            text_len    : length of text parameter of shape `(batch,)`
         """
         if self.audio_input == 'both':
-            s = self.SPEC(speech)
-            g = self.EMBD(speech)
-            emb_s, LDN = self.AE(s, g)
-        else:            
-            feat = self.FEAT(speech)
-            emb_s, LDN = self.AE(feat)
-        emb_t = self.TE(text)
-        attention_output, affinity_matrix = self.EXT(emb_s, emb_t)
-        prob, LD = self.DIS(attention_output)
-
+            speech, gemb = speech
+            s_len, g_len = speech_len
+            speech, s_mask = self.SPEC(speech, verbose)
+            assert gemb.shape[-1] == 96
+            assert speech.shape[1]//8 == gemb.shape[1]
+            g_mask = sequence_mask(g_len, gemb.shape[1])
+            emb_s, LDN, emb_s_mask = self.AE((speech, gemb), (s_mask, g_mask), verbose)
+        else:           
+            if self.audio_input == 'raw': 
+                speech, s_mask = self.FEAT(speech, verbose)
+            elif self.audio_input == 'google_embed':
+                speech = speech
+                s_mask = sequence_mask(speech_len, speech.shape[1])
+            
+            emb_s, LDN, emb_s_mask = self.AE(speech, s_mask, verbose)
+        
+        emb_t, emb_t_mask = self.TE(text, verbose)
+        
+        attention_output, affinity_matrix, attention_mask, affinity_mask = self.EXT(emb_s, emb_t, emb_s_mask, emb_t_mask, verbose)
+        prob, LD = self.DIS(attention_output, attention_mask, verbose)
+        
         if self.stack_extractor:
-            n_speech = tf.math.reduce_sum(tf.cast(emb_s._keras_mask, tf.float32), -1)
-            n_text = tf.math.reduce_sum(tf.cast(emb_t._keras_mask, tf.float32), -1)
+            n_speech = torch.sum(emb_s_mask, dim=-1)
+            n_text = torch.sum(emb_t_mask, dim=-1)
             n_total = n_speech + n_text
-            valid_mask = tf.sequence_mask(n_total, maxlen=tf.shape(attention_output)[1], dtype=tf.float32) - tf.sequence_mask(n_speech, maxlen=tf.shape(attention_output)[1], dtype=tf.float32)
-            valid_attention_output = tf.ragged.boolean_mask(attention_output, tf.cast(valid_mask, tf.bool)).to_tensor(0.)
+            # Masking only for the text part: [False, ..., False, True, ..., True, False, ...]
+            valid_mask = torch.logical_xor(sequence_mask(n_total, max_length=attention_output.shape[1]), sequence_mask(n_speech, max_length=attention_output.shape[1]))
+            indices = torch.masked_fill(torch.cumsum(valid_mask.int(), dim=1), ~valid_mask, 0)
+            masked = torch.zeros(attention_output.shape[0], attention_output.shape[1]+1, attention_output.shape[2]).to(attention_output.device)
+            masked = torch.scatter(input=masked, dim=1, index=torch.stack([indices for _ in range(attention_output.shape[-1])], dim=-1), src=attention_output)
+            valid_attention_output = masked[:,1:torch.max(n_text)+1]
             seq_ce_logit = self.seq_ce_logit(valid_attention_output)[:,:,0]
-            seq_ce_logit = tf.pad(seq_ce_logit, [[0, 0],[0, tf.shape(emb_t)[1] - tf.shape(seq_ce_logit)[1]]], 'CONSTANT', constant_values=0.)
-            seq_ce_logit._keras_mask = emb_t._keras_mask
-
+            seq_ce_logit = nn.functional.pad(seq_ce_logit, (0, emb_t.shape[1] - seq_ce_logit.shape[1]), value=0.)
+            seq_ce_logit_mask = emb_t_mask
+            seq_ce_logit = torch.nan_to_num(seq_ce_logit) * seq_ce_logit_mask
+        
         else:
             seq_ce_logit = self.seq_ce_logit(attention_output)[:,:,0]
-            seq_ce_logit._keras_mask = attention_output._keras_mask
-            
-        return prob, affinity_matrix, LD, seq_ce_logit
+            seq_ce_logit_mask = attention_mask
+            seq_ce_logit = torch.nan_to_num(seq_ce_logit) * seq_ce_logit_mask
+        
+
+        return prob, affinity_matrix, LD, seq_ce_logit, affinity_mask, seq_ce_logit_mask

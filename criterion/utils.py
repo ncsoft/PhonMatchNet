@@ -1,9 +1,12 @@
 import numpy as np
 import sklearn.metrics
-import tensorflow as tf
+import torch
+from torchmetrics import Metric
 
 def compute_eer(label, pred):
     # all fpr, tpr, fnr, fnr, threshold are lists (in the format of np.array)
+    label = torch.nan_to_num(label).detach().cpu().numpy()
+    pred = torch.nan_to_num(pred).detach().cpu().numpy()
     fpr, tpr, threshold = sklearn.metrics.roc_curve(label, pred)
     fnr = 1 - tpr
 
@@ -18,15 +21,19 @@ def compute_eer(label, pred):
     eer = (eer_1 + eer_2) / 2
     return eer
 
-class eer(tf.keras.metrics.Metric):
-    def __init__(self, name='equal_error_rate', **kwargs):
-        super(eer, self).__init__(name=name, **kwargs)
-        self.score = self.add_weight(name='eer', initializer='zeros')
-        self.count = self.add_weight(name='count', initializer='zeros')
+class eer(Metric):
+    # reference: https://pypi.org/project/torchmetrics/
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.add_state("score", default=torch.tensor(0, dtype=torch.float), dist_reduce_fx="sum")
+        self.add_state("count", default=torch.tensor(0, dtype=torch.float), dist_reduce_fx="sum")
 
-    def update_state(self, y_true, y_pred):
-        self.score.assign_add(tf.reduce_sum(tf.py_function(func=compute_eer, inp=[y_true, y_pred], Tout=tf.float32,  name='compute_eer')))
-        self.count.assign_add(1)
+    def update(self, y_true, y_pred):
+        self.score += torch.tensor(compute_eer(y_true, y_pred), dtype=self.score.dtype)
+        self.count += torch.tensor(1.0)
 
-    def result(self):
-        return tf.math.divide_no_nan(self.score, self.count)
+    def compute(self):
+        if self.count == 0:
+            return torch.tensor(0, dtype=torch.float)
+        score = torch.nan_to_num(self.score).float()
+        return score / self.count

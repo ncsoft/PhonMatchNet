@@ -6,7 +6,7 @@ class GoogleSpeechEmbedder(Model):
     def __init__(self, name="google_embedding", **kwargs):
         super(GoogleSpeechEmbedder, self).__init__(name=name)
         
-        self._embeddingModel = tf.saved_model.load(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'google_speech_embedding'), tags=[]).signatures["default"]
+        self._embeddingModel = tf.saved_model.load(os.path.join(os.path.abspath(os.path.dirname(__file__)), 'checkpoint'), tags=[]).signatures["default"]
         self.window = 12400
         self.shift = 1280
         self.pre_padding = self.window - self.shift

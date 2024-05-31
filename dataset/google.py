@@ -4,29 +4,25 @@ import numpy as np
 import pandas as pd
 from multiprocessing import Pool
 from scipy.io import wavfile
-import tensorflow as tf
-
-from tensorflow.keras.utils import Sequence, OrderedEnqueuer
-from tensorflow.keras import layers
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import torch
 
 sys.path.append(os.path.dirname(__file__))
 from g2p.g2p_en.g2p import G2p
 
-import warnings
-warnings.filterwarnings("ignore", category=np.VisibleDeprecationWarning)
-np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
 
-class GoogleCommandsDataloader(Sequence):
+class GoogleCommandsDataset(torch.utils.data.Dataset):
     def __init__(self, 
                  batch_size,
                  fs = 16000,
                  wav_dir='/home/DB/google_speech_commands',
+                 gemb_dir=None,
                  target_list=['yes', 'no', 'up', 'down', 'left', 'right', 'on', 'off', 'stop', 'go'],
                  features='g2p_embed', # phoneme, g2p_embed, both ...
                  shuffle=True,
                  testset_only=False,
                  pkl=None,
+                 frame_length=None,
+                 hop_length=None,
                  ):
         
         phonemes = ["<pad>", ] + ['AA0', 'AA1', 'AA2', 'AE0', 'AE1', 'AE2', 'AH0', 'AH1', 'AH2', 'AO0',
@@ -44,11 +40,14 @@ class GoogleCommandsDataloader(Sequence):
         self.batch_size = batch_size
         self.fs = fs
         self.wav_dir = wav_dir
+        self.gemb_dir = gemb_dir
         self.target_list = [x.lower() for x in target_list]
         self.testset_only = testset_only
         self.features = features
         self.shuffle = shuffle
         self.pkl = pkl
+        self.frame_length = frame_length
+        self.hop_length = hop_length
         self.nPhoneme = len(phonemes)
         self.g2p = G2p()
                 
@@ -87,7 +86,7 @@ class GoogleCommandsDataloader(Sequence):
                             'label': label
                             }
                         idx += 1
-            self.data = self.data.append(pd.DataFrame.from_dict(target_dict, 'index'), ignore_index=True)
+            self.data = pd.concat([self.data, pd.DataFrame.from_dict(target_dict, 'index')], ignore_index=True)
     
             # g2p & p2idx by g2p_en package
             print(">> Convert word to phoneme")
@@ -111,78 +110,87 @@ class GoogleCommandsDataloader(Sequence):
         self.len = len(self.data)
         self.maxlen_t = int((int(self.data['text'].apply(lambda x: len(x)).max() / 10) + 1) * 10)
         self.maxlen_a = int((int(self.data['duration'].values[-1] / 0.5) + 1 ) * self.fs / 2)
-
+                            
     def __len__(self):
-        # return total batch-wise length
-        return math.ceil(self.len / self.batch_size)
+        return self.len
 
     def _load_wav(self, wav):
         return np.array(wavfile.read(wav)[1]).astype(np.float32) / 32768.0
     
     def __getitem__(self, idx):
         # chunking
-        indices = self.indices[idx * self.batch_size : (idx + 1) * self.batch_size]
+        i = self.indices[idx]
         
         # load inputs
-        batch_x = [np.array(wavfile.read(self.wav_list[i])[1]).astype(np.float32) / 32768.0 for i in indices]
+        x = torch.Tensor(wavfile.read(self.wav_list[i])[1]).to(torch.float32) / 32768.0
         if self.features == 'both':
-            batch_p = [np.array(self.idx_list[i]).astype(np.int32) for i in indices]
-            batch_e = [np.array(self.emb_list[i]).astype(np.float32) for i in indices]
+            p = torch.Tensor(self.idx_list[i]).to(torch.int32)
+            e = torch.Tensor(self.emb_list[i]).to(torch.float32)
         else:
             if self.features == 'phoneme':
-                batch_y = [np.array(self.idx_list[i]).astype(np.int32) for i in indices]
+                y = torch.Tensor(self.idx_list[i]).to(torch.int32)
             elif self.features == 'g2p_embed':
-                batch_y = [np.array(self.emb_list[i]).astype(np.float32) for i in indices]
+                y = torch.Tensor(self.emb_list[i]).to(torch.float32)
+        
         # load outputs
-        batch_z = [np.array([self.lab_list[i]]).astype(np.float32) for i in indices]
-
-        # padding and masking
-        pad_batch_x = pad_sequences(np.array(batch_x), maxlen=self.maxlen_a, value=0.0, padding='post', dtype=batch_x[0].dtype)
-        if self.features == 'both':
-            pad_batch_p = pad_sequences(np.array(batch_p), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_p[0].dtype)
-            pad_batch_e = pad_sequences(np.array(batch_e), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_e[0].dtype)
+        z = torch.Tensor([self.lab_list[i]]).to(torch.float32)
+        
+        if self.gemb_dir is not None:
+            file_dirs = os.path.splitext(self.wav_list[i])[0]
+            file_dirs = file_dirs.split("/")
+            filepath = file_dirs[-1] + '.npy'
+            dirpath = os.path.join(*file_dirs[3:-1])
+            gemb = torch.from_numpy(np.load(os.path.join(self.gemb_dir, dirpath, filepath))[0]).to(torch.float32)
         else:
-            pad_batch_y = pad_sequences(np.array(batch_y), maxlen=self.maxlen_t, value=0.0, padding='post', dtype=batch_y[0].dtype)
-        pad_batch_z = pad_sequences(np.array(batch_z), value=0.0, padding='post', dtype=batch_z[0].dtype)
+            gemb = None
 
         if self.features == 'both':
-            return pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z
+            return {"x": x, "gemb": gemb, "y": None, "p": p, "e": e, "z": z,}
         else:
-            return pad_batch_x, pad_batch_y, pad_batch_z
-
+            return {"x": x, "gemb": gemb, "y": y, "p": None, "e": None, "z": z,}
+    
     def on_epoch_end(self):
         self.indices = np.arange(self.len)
         if self.shuffle == True:
             np.random.shuffle(self.indices)
 
-def convert_sequence_to_dataset(dataloader):
-    def data_generator():
-        for i in range(dataloader.__len__()):
-            if dataloader.features == 'both':
-                pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z = dataloader[i]
-                yield pad_batch_x, pad_batch_p, pad_batch_e, pad_batch_z
-            else:
-                pad_batch_x, pad_batch_y, pad_batch_z = dataloader[i]
-                yield pad_batch_x, pad_batch_y, pad_batch_z
-    
-    if dataloader.features == 'both':
-        data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-            tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, dataloader.maxlen_t), dtype=tf.int32),
-            tf.TensorSpec(shape=(None, dataloader.maxlen_t, 256), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-        )
-    else:
-        data_dataset =  tf.data.Dataset.from_generator(data_generator, output_signature=(
-            tf.TensorSpec(shape=(None, dataloader.maxlen_a), dtype=tf.float32),
-            tf.TensorSpec(shape=(None, dataloader.maxlen_t) if dataloader.features == 'phoneme' else (None, dataloader.maxlen_t, 256),
-                        dtype=tf.int32 if dataloader.features == 'phoneme' else tf.float32),
-            tf.TensorSpec(shape=(None, 1), dtype=tf.float32),)
-        )
-    # data_dataset = data_dataset.cache()
-    data_dataset = data_dataset.prefetch(1)
-    
-    return data_dataset
+    def pad_sequence(self, data, max_len):
+        pad_list = [0 for _ in range(data[0].dim()*2)]
+        pad_list[-1] = max_len - data[0].shape[0]
+        data[0] = torch.nn.functional.pad(data[0], tuple(pad_list))
+        return torch.nn.utils.rnn.pad_sequence(data, batch_first=True)
 
-if __name__ == '__main__':
-    dataloader = GoogleCommandsDataloader(2048, testset_only=True, pkl='/home/DB/google_speech_commands/google_testset.pkl', features='g2p_embed')
+    def collate(self, batch):
+        '''
+            batch = [{"x", "gemb", "y", "p", "e", "z",}]
+        '''
+        batch_dict = {
+            "x": None,          "x_len": None,
+            "gemb": None,       "gemb_len": None, 
+            "y": None,          "y_len": None,
+            "p": None,          "p_len": None,
+            "e": None,          "e_len": None,
+            "z": None,          "z_len": None,
+            }
+        
+        device = batch[0]["x"].device
+        batch_dict["x"] = self.pad_sequence([b["x"] for b in batch], self.maxlen_a)
+        batch_dict["z"] = torch.nn.utils.rnn.pad_sequence([b["z"] for b in batch], batch_first=True)
+        batch_dict["x_len"] = torch.Tensor([b["x"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        # batch_dict["z_len"] = torch.Tensor([b["z"].shape[0] for b in batch]).to(torch.int32) # always [1,1, ...]
+        
+        if self.features == 'both':
+            batch_dict["p"] = self.pad_sequence([b["p"] for b in batch], self.maxlen_t)
+            batch_dict["e"] = self.pad_sequence([b["e"] for b in batch], self.maxlen_t)
+            batch_dict["p_len"] = torch.Tensor([b["p"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+            batch_dict["e_len"] = torch.Tensor([b["e"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        else:
+            batch_dict["y"] = self.pad_sequence([b["y"] for b in batch], self.maxlen_t)
+            batch_dict["y_len"] = torch.Tensor([b["y"].shape[0] for b in batch]).to(dtype=torch.int32, device=device)
+        
+        if self.gemb_dir is not None:
+            batch_dict["gemb"] = self.pad_sequence([b["gemb"] for b in batch], int(int((self.maxlen_a - self.frame_length)/self.hop_length + 1)/8))
+            batch_dict["gemb_len"] = torch.Tensor([int(int((b["x"].shape[0] - self.frame_length)/self.hop_length + 1)/8) for b in batch]).to(dtype=torch.int32, device=device)
+
+        return batch_dict
+
