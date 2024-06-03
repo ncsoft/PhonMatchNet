@@ -2,6 +2,8 @@
 
 Official implementation of PhonMatchNet: Phoneme-Guided Zero-Shot Keyword Spotting for User-Defined Keywords.
 
+PyTorch version: https://github.com/ncsoft/PhonMatchNet/tree/pytorch
+
 ## Requirements
 
 ### Datasets
